@@ -1,0 +1,5 @@
+// Chord track for HymnR.mid
+
+R R R C | F C G7 C | G  G C G | Am Am E7 E7 | Am Am R C |
+        | F C G7 C | G  G C G | Am Am E7 E7 | Am |
+

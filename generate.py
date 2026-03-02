@@ -44,7 +44,7 @@ def _parse_chord_name(name: str) -> int:
     Handles root (with optional sharp/flat), quality suffix, and special
     tokens like ``rest``.
     """
-    if name == "rest":
+    if name.lower() in ("rest", "r"):
         return VOCABULARY.index("chord_rest")
 
     # Extract root: letter + optional accidental
@@ -74,9 +74,10 @@ def parse_chord_file(path: str) -> list[int]:
     """
     text = open(path).read()
 
-    # Strip comment lines, join remaining with | so newlines act as bar boundaries
+    # Strip comment lines (# or //), join remaining with | so newlines act as bar boundaries
     lines = [line for line in text.splitlines()
-             if not line.strip().startswith("#")]
+             if not line.strip().startswith("#")
+             and not line.strip().startswith("//")]
     flat = " | ".join(lines)
 
     # Split on bar delimiters

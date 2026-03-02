@@ -75,6 +75,12 @@ def test_rest() -> None:
     assert all(VOCABULARY[t] == "chord_rest" for t in tokens)
 
 
+def test_rest_shorthand_R() -> None:
+    """R and r are aliases for rest."""
+    assert VOCABULARY[_parse_chord_name("R")] == "chord_rest"
+    assert VOCABULARY[_parse_chord_name("r")] == "chord_rest"
+
+
 def test_seventh_chords() -> None:
     """7th chord suffixes map to the correct quality."""
     assert VOCABULARY[_parse_chord_name("G7")] == "chord_G_major"
@@ -94,9 +100,16 @@ def test_unknown_chord_exits() -> None:
         _parse_chord_name("Csus4")
 
 
-def test_comments_ignored() -> None:
+def test_comments_hash() -> None:
     """Lines starting with # are ignored."""
     path = _write_chord_file("# This is a comment\nC | Am\n# Another comment\nF | G")
+    tokens = parse_chord_file(path)
+    assert len(tokens) == 4 * STEPS_PER_BAR
+
+
+def test_comments_double_slash() -> None:
+    """Lines starting with // are ignored."""
+    path = _write_chord_file("// Chord track\nC | Am\nF | G")
     tokens = parse_chord_file(path)
     assert len(tokens) == 4 * STEPS_PER_BAR
 
