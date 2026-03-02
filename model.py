@@ -366,6 +366,8 @@ class TonicNet(nn.Module):
                 else:
                     x = PITCH_REST
             else:
+                if soprano_tokens is not None:
+                    logits[0, SONG_END] = float("-inf")
                 probs = torch.softmax(logits, dim=-1)
                 x = torch.multinomial(probs, 1).item()
 
