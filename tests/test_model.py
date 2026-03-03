@@ -1,4 +1,4 @@
-"""Tests for the causal Transformer TonicNet model."""
+"""Tests for TonicNet models (Transformer and GRU)."""
 
 import tempfile
 from pathlib import Path
@@ -7,14 +7,20 @@ import torch
 import pytest
 
 from model import (
-    TonicNet, VOCABULARY, SONG_START, SONG_END, PITCH_REST, MODEL_VERSION,
-    load_checkpoint, _CHORD_PITCH_CLASSES, _PITCH_TOKEN_PC,
+    TonicNet, GRUTonicNet, _TonicNetBase,
+    VOCABULARY, SONG_START, SONG_END, PITCH_REST, MODEL_VERSION,
+    load_model, _CHORD_PITCH_CLASSES, _PITCH_TOKEN_PC,
 )
 
 
 @pytest.fixture
 def model() -> TonicNet:
     return TonicNet()
+
+
+@pytest.fixture
+def gru_model() -> GRUTonicNet:
+    return GRUTonicNet()
 
 
 def test_forward_shape(model: TonicNet) -> None:
@@ -152,10 +158,35 @@ def test_checkpoint_roundtrip(model: TonicNet) -> None:
     """Save versioned checkpoint, load back, verify weights match."""
     with tempfile.TemporaryDirectory() as tmp:
         path = str(Path(tmp) / "test.pt")
-        torch.save({"version": MODEL_VERSION, "state_dict": model.state_dict()}, path)
-        loaded = load_checkpoint(path, torch.device("cpu"))
+        torch.save({"version": MODEL_VERSION, "model_type": "xformer",
+                     "state_dict": model.state_dict()}, path)
+        loaded = load_model(path, torch.device("cpu"))
+        assert isinstance(loaded, TonicNet)
         for key in model.state_dict():
-            assert torch.equal(model.state_dict()[key], loaded[key]), f"Mismatch on {key}"
+            assert torch.equal(model.state_dict()[key], loaded.state_dict()[key]), \
+                f"Mismatch on {key}"
+
+
+def test_checkpoint_roundtrip_gru(gru_model: GRUTonicNet) -> None:
+    """Save GRU checkpoint, load back, verify weights and type."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "test_gru.pt")
+        torch.save({"version": MODEL_VERSION, "model_type": "gru",
+                     "state_dict": gru_model.state_dict()}, path)
+        loaded = load_model(path, torch.device("cpu"))
+        assert isinstance(loaded, GRUTonicNet)
+        for key in gru_model.state_dict():
+            assert torch.equal(gru_model.state_dict()[key], loaded.state_dict()[key]), \
+                f"Mismatch on {key}"
+
+
+def test_checkpoint_defaults_to_xformer(model: TonicNet) -> None:
+    """Checkpoint without model_type field defaults to xformer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "test.pt")
+        torch.save({"version": MODEL_VERSION, "state_dict": model.state_dict()}, path)
+        loaded = load_model(path, torch.device("cpu"))
+        assert isinstance(loaded, TonicNet)
 
 
 def test_checkpoint_version_mismatch() -> None:
@@ -164,7 +195,7 @@ def test_checkpoint_version_mismatch() -> None:
         path = str(Path(tmp) / "bad.pt")
         torch.save({"version": MODEL_VERSION - 1, "state_dict": {}}, path)
         with pytest.raises(SystemExit):
-            load_checkpoint(path, torch.device("cpu"))
+            load_model(path, torch.device("cpu"))
 
 
 def test_checkpoint_no_version() -> None:
@@ -173,7 +204,7 @@ def test_checkpoint_no_version() -> None:
         path = str(Path(tmp) / "old.pt")
         torch.save({"some_key": torch.zeros(1)}, path)
         with pytest.raises(SystemExit):
-            load_checkpoint(path, torch.device("cpu"))
+            load_model(path, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +342,77 @@ def test_generate_chord_bias_favors_chord_tones(model: TonicNet) -> None:
         voice = idx % 5
         if voice == 0:
             continue  # skip chord positions
+        tok = x_seq[idx + 1]
+        if tok in _PITCH_TOKEN_PC:
+            total_pitch_count += 1
+            if _PITCH_TOKEN_PC[tok] in c_maj_pcs:
+                chord_tone_count += 1
+
+    assert total_pitch_count > 0, "No pitch tokens were sampled"
+    ratio = chord_tone_count / total_pitch_count
+    assert ratio > 0.6, \
+        f"Only {ratio:.1%} chord tones with bias=5.0 (expected >60%)"
+
+
+# ---------------------------------------------------------------------------
+# GRU model tests
+# ---------------------------------------------------------------------------
+
+def test_gru_forward_shape(gru_model: GRUTonicNet) -> None:
+    """GRU output has correct dimensions [batch, seq_len, vocab_size]."""
+    B, S = 2, 50
+    x = torch.randint(0, 99, (B, S))
+    r = torch.randint(0, 80, (B, S))
+    p = torch.randint(0, 16, (B, S))
+    c = torch.randint(0, 48, (B, S))
+    logits = gru_model(x, r, p, c)
+    assert logits.shape == (B, S, 99)
+
+
+def test_gru_generate_basic(gru_model: GRUTonicNet) -> None:
+    """GRU generate produces valid sequences starting with song_start."""
+    x_seq, r_seq, p_seq, c_seq = gru_model.generate(bars=4, temperature=0.8)
+    assert x_seq[0] == SONG_START
+    assert len(x_seq) >= 2
+    assert len(r_seq) == len(x_seq)
+    assert len(p_seq) == len(x_seq) - 1
+    assert len(c_seq) == len(x_seq) - 1
+    assert all(0 <= t < 99 for t in x_seq)
+    assert all(0 <= v < 48 for v in c_seq)
+
+
+def test_gru_generate_chord_forced(gru_model: GRUTonicNet) -> None:
+    """Chord positions in GRU generation match the forced tokens."""
+    chord_C = VOCABULARY.index("chord_C_major")
+    chord_Am = VOCABULARY.index("chord_A_minor")
+    chords = [chord_C if i < 8 else chord_Am for i in range(16)]
+
+    x_seq, _, _, _ = gru_model.generate(temperature=0.8, chord_tokens=chords)
+
+    for timestep in range(16):
+        loop_idx = timestep * 5
+        seq_pos = loop_idx + 1
+        if seq_pos < len(x_seq):
+            assert x_seq[seq_pos] == chords[timestep], \
+                f"Chord mismatch at timestep {timestep} (seq_pos {seq_pos}): " \
+                f"expected {VOCABULARY[chords[timestep]]}, got {VOCABULARY[x_seq[seq_pos]]}"
+
+
+def test_gru_generate_chord_bias(gru_model: GRUTonicNet) -> None:
+    """Strong chord bias makes the majority of GRU-sampled pitches be chord tones."""
+    chord_C = VOCABULARY.index("chord_C_major")
+    chords = [chord_C] * 32
+    c_maj_pcs = _CHORD_PITCH_CLASSES[chord_C]
+
+    x_seq, _, _, _ = gru_model.generate(
+        temperature=0.8, chord_tokens=chords, chord_bias=5.0)
+
+    chord_tone_count = 0
+    total_pitch_count = 0
+    for idx in range(len(x_seq) - 1):
+        voice = idx % 5
+        if voice == 0:
+            continue
         tok = x_seq[idx + 1]
         if tok in _PITCH_TOKEN_PC:
             total_pitch_count += 1

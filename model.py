@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""PyTorch TonicNet model — Causal Transformer with KV-cache.
+"""PyTorch TonicNet models — Causal Transformer and GRU with shared generation.
 
-Architecture: 4-layer pre-norm Transformer, sinusoidal positions,
-repetition/position embeddings, output skip connection.
-99-token vocabulary: song_start, song_end, 50 chords, 47 pitches.
+Architectures:
+  TonicNet:     4-layer pre-norm Transformer, sinusoidal positions, KV-cache.
+  GRUTonicNet:  3-layer GRU, compressed hidden state.
+
+Both share: 99-token vocabulary, repetition/position/countdown embeddings,
+output skip connection, autoregressive generation with voice masking.
 """
 
 import itertools
 import math
 import sys
+from abc import ABC, abstractmethod
+from typing import Any
 
 import music21
 import torch
@@ -60,7 +65,7 @@ _QUALITY_INTERVALS: dict[str, tuple[int, ...]] = {
 
 
 def _build_chord_pitch_classes() -> dict[int, set[int]]:
-    """Map each chord vocab index → set of pitch classes (0–11) in that triad."""
+    """Map each chord vocab index -> set of pitch classes (0-11) in that triad."""
     result: dict[int, set[int]] = {}
     for root_pc in range(12):
         for quality, intervals in _QUALITY_INTERVALS.items():
@@ -71,7 +76,7 @@ def _build_chord_pitch_classes() -> dict[int, set[int]]:
 
 
 def _build_pitch_token_pc() -> dict[int, int]:
-    """Map each pitch vocab index → its pitch class (0–11).  Excludes pitch_rest."""
+    """Map each pitch vocab index -> its pitch class (0-11).  Excludes pitch_rest."""
     result: dict[int, int] = {}
     for i, tok in enumerate(VOCABULARY):
         if tok.startswith("pitch_") and tok != "pitch_rest":
@@ -82,22 +87,6 @@ def _build_pitch_token_pc() -> dict[int, int]:
 
 _CHORD_PITCH_CLASSES: dict[int, set[int]] = _build_chord_pitch_classes()
 _PITCH_TOKEN_PC: dict[int, int] = _build_pitch_token_pc()
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint I/O
-# ---------------------------------------------------------------------------
-
-def load_checkpoint(path: str, device: torch.device) -> dict[str, torch.Tensor]:
-    """Load a versioned checkpoint, failing fast on version mismatch."""
-    data = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(data, dict) and "version" in data:
-        if data["version"] != MODEL_VERSION:
-            sys.exit(f"ERROR: {path} is version {data['version']}, "
-                     f"expected {MODEL_VERSION}. Retrain required.")
-        return data["state_dict"]
-    sys.exit(f"ERROR: {path} has no version field (pre-v4 checkpoint). "
-             f"Retrain required.")
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +127,7 @@ def build_causal_pad_mask(
         )
         return causal.unsqueeze(0).unsqueeze(0) + pad_attn          # [B,1,S,S]
 
-    return causal  # [S, S] — SDPA broadcasts over batch and heads
+    return causal  # [S, S] -- SDPA broadcasts over batch and heads
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +174,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: LN → Attn → residual, LN → FFN → residual."""
+    """Pre-norm Transformer block: LN -> Attn -> residual, LN -> FFN -> residual."""
 
     def __init__(self, d_model: int, n_heads: int, dff: int, dropout: float = 0.1):
         super().__init__()
@@ -218,11 +207,15 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Model
+# Base model
 # ---------------------------------------------------------------------------
 
-class TonicNet(nn.Module):
-    """Causal Transformer for polyphonic music with repetition/position/countdown embeddings."""
+class _TonicNetBase(ABC, nn.Module):
+    """Shared base for TonicNet architectures.
+
+    Provides: embeddings, weight init, autoregressive generate().
+    Subclasses implement: forward(), _init_recurrence(), _step(), and define self.dense.
+    """
 
     def __init__(
         self,
@@ -234,46 +227,19 @@ class TonicNet(nn.Module):
         p_dim: int = 8,
         c_tokens: int = 48,
         c_dim: int = 8,
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 4,
-        dff: int = 512,
-        max_seq_len: int = 3072,
-        dropout: float = 0.1,
     ):
         super().__init__()
         self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.n_layers = n_layers
+        self.x_dim = x_dim
         self.r_dim = r_dim
         self.p_dim = p_dim
         self.c_dim = c_dim
         self.c_tokens = c_tokens
 
-        # Embeddings
         self.embedding_x = nn.Embedding(vocab_size, x_dim)
         self.embedding_r = nn.Embedding(r_tokens, r_dim)
         self.embedding_p = nn.Embedding(p_tokens, p_dim)
         self.embedding_c = nn.Embedding(c_tokens, c_dim)
-
-        input_dim = x_dim + r_dim + p_dim + c_dim  # 148
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        # Sinusoidal position encoding (not learned)
-        self.register_buffer("pos_enc", sinusoidal_positions(max_seq_len, d_model))
-
-        # Transformer layers
-        self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, dff, dropout)
-            for _ in range(n_layers)
-        ])
-        self.ln_final = nn.LayerNorm(d_model)
-        self.drop_in = nn.Dropout(dropout)
-
-        # Output: skip connection with r/p/c embeddings
-        self.dense = nn.Linear(d_model + r_dim + p_dim + c_dim, vocab_size)
-
-        self._init_weights()
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -284,6 +250,7 @@ class TonicNet(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
+    @abstractmethod
     def forward(
         self,
         x: torch.Tensor,
@@ -292,38 +259,29 @@ class TonicNet(nn.Module):
         c: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass for training (full sequences).
+        ...
 
-        Args:
-            x: token indices       [batch, seq_len]
-            r: repetition ids      [batch, seq_len]
-            p: position ids        [batch, seq_len]
-            c: countdown (bars remaining) [batch, seq_len]
-            pad_mask: bool tensor  [batch, seq_len], True = valid token
+    @abstractmethod
+    def _init_recurrence(self, device: torch.device, max_steps: int) -> Any:
+        """Return initial recurrence state for autoregressive generation."""
+        ...
 
-        Returns:
-            logits [batch, seq_len, vocab_size]
+    @abstractmethod
+    def _step(
+        self,
+        x_emb: torch.Tensor,
+        r_emb: torch.Tensor,
+        p_emb: torch.Tensor,
+        c_emb: torch.Tensor,
+        index: int,
+        state: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        """Single autoregressive step.
+
+        Returns (h, new_state) where h includes the skip connection
+        and is ready for self.dense().
         """
-        B, S = x.shape
-        x_emb = self.embedding_x(x)
-        r_emb = self.embedding_r(r)
-        p_emb = self.embedding_p(p)
-        c_emb = self.embedding_c(c)
-
-        h = self.input_proj(torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1))
-        h = h + self.pos_enc[:, :S, :]
-        h = self.drop_in(h)
-
-        attn_mask = build_causal_pad_mask(S, pad_mask, device=h.device)
-
-        for layer in self.layers:
-            h, _ = layer(h, attn_mask=attn_mask)
-
-        h = self.ln_final(h)
-
-        # Skip connection: concat transformer output with r, p, c embeddings
-        h = torch.cat([h, r_emb, p_emb, c_emb], dim=-1)
-        return self.dense(h)
+        ...
 
     @torch.no_grad()
     def generate(
@@ -335,7 +293,7 @@ class TonicNet(nn.Module):
         chord_tokens: list[int] | None = None,
         chord_bias: float = 0.0,
     ) -> tuple[list[int], list[int], list[int], list[int]]:
-        """Autoregressive sampling with KV-cache.
+        """Autoregressive sampling.
 
         Args:
             bars: desired length in bars (used for countdown conditioning
@@ -374,16 +332,7 @@ class TonicNet(nn.Module):
         p_sequence: list[int] = []
         c_sequence: list[int] = []
 
-        # Extend position encodings if generation exceeds the buffer
-        if max_steps >= self.pos_enc.size(1):
-            pos_enc = sinusoidal_positions(max_steps + 1, self.d_model).to(device)
-        else:
-            pos_enc = self.pos_enc
-
-        # Per-layer KV cache: list of (K, V) tuples
-        kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] = [
-            None for _ in range(self.n_layers)
-        ]
+        state = self._init_recurrence(device, max_steps)
 
         for index in range(max_steps):
             p = 0 if index == 0 else (index - 1) // 5 % 16
@@ -401,16 +350,7 @@ class TonicNet(nn.Module):
             p_emb = self.embedding_p(p_t)
             c_emb = self.embedding_c(c_t)
 
-            h = self.input_proj(torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1))
-            h = h + pos_enc[:, index:index + 1, :]
-
-            # No causal mask needed: single query, KV-cache has only past
-            for i, layer in enumerate(self.layers):
-                h, new_cache = layer(h, attn_mask=None, kv_cache=kv_caches[i])
-                kv_caches[i] = new_cache
-
-            h = self.ln_final(h)
-            h = torch.cat([h, r_emb, p_emb, c_emb], dim=-1)
+            h, state = self._step(x_emb, r_emb, p_emb, c_emb, index, state)
             logits = self.dense(h).squeeze(0) / temperature
 
             # Force known tokens at chord/soprano positions instead of sampling.
@@ -465,3 +405,269 @@ class TonicNet(nn.Module):
                 break
 
         return x_sequence, r_sequence, p_sequence, c_sequence
+
+
+# ---------------------------------------------------------------------------
+# Transformer model
+# ---------------------------------------------------------------------------
+
+class TonicNet(_TonicNetBase):
+    """Causal Transformer for polyphonic music with repetition/position/countdown embeddings."""
+
+    def __init__(
+        self,
+        vocab_size: int = 99,
+        x_dim: int = 100,
+        r_tokens: int = 80,
+        r_dim: int = 32,
+        p_tokens: int = 16,
+        p_dim: int = 8,
+        c_tokens: int = 48,
+        c_dim: int = 8,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        dff: int = 512,
+        max_seq_len: int = 3072,
+        dropout: float = 0.1,
+    ):
+        super().__init__(vocab_size, x_dim, r_tokens, r_dim, p_tokens, p_dim, c_tokens, c_dim)
+        self.d_model = d_model
+        self.n_layers = n_layers
+
+        input_dim = x_dim + r_dim + p_dim + c_dim  # 148
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        # Sinusoidal position encoding (not learned)
+        self.register_buffer("pos_enc", sinusoidal_positions(max_seq_len, d_model))
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, dff, dropout)
+            for _ in range(n_layers)
+        ])
+        self.ln_final = nn.LayerNorm(d_model)
+        self.drop_in = nn.Dropout(dropout)
+
+        # Output: skip connection with r/p/c embeddings
+        self.dense = nn.Linear(d_model + r_dim + p_dim + c_dim, vocab_size)
+
+        self._init_weights()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        r: torch.Tensor,
+        p: torch.Tensor,
+        c: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass for training (full sequences).
+
+        Args:
+            x: token indices       [batch, seq_len]
+            r: repetition ids      [batch, seq_len]
+            p: position ids        [batch, seq_len]
+            c: countdown (bars remaining) [batch, seq_len]
+            pad_mask: bool tensor  [batch, seq_len], True = valid token
+
+        Returns:
+            logits [batch, seq_len, vocab_size]
+        """
+        B, S = x.shape
+        x_emb = self.embedding_x(x)
+        r_emb = self.embedding_r(r)
+        p_emb = self.embedding_p(p)
+        c_emb = self.embedding_c(c)
+
+        h = self.input_proj(torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1))
+        h = h + self.pos_enc[:, :S, :]
+        h = self.drop_in(h)
+
+        attn_mask = build_causal_pad_mask(S, pad_mask, device=h.device)
+
+        for layer in self.layers:
+            h, _ = layer(h, attn_mask=attn_mask)
+
+        h = self.ln_final(h)
+
+        # Skip connection: concat transformer output with r, p, c embeddings
+        h = torch.cat([h, r_emb, p_emb, c_emb], dim=-1)
+        return self.dense(h)
+
+    def _init_recurrence(self, device: torch.device, max_steps: int) -> Any:
+        # Extend position encodings if generation exceeds the buffer
+        if max_steps >= self.pos_enc.size(1):
+            pos_enc = sinusoidal_positions(max_steps + 1, self.d_model).to(device)
+        else:
+            pos_enc = self.pos_enc
+
+        # Per-layer KV cache: list of (K, V) tuples
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] = [
+            None for _ in range(self.n_layers)
+        ]
+        return (pos_enc, kv_caches)
+
+    def _step(
+        self,
+        x_emb: torch.Tensor,
+        r_emb: torch.Tensor,
+        p_emb: torch.Tensor,
+        c_emb: torch.Tensor,
+        index: int,
+        state: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        pos_enc, kv_caches = state
+
+        h = self.input_proj(torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1))
+        h = h + pos_enc[:, index:index + 1, :]
+
+        # No causal mask needed: single query, KV-cache has only past
+        for i, layer in enumerate(self.layers):
+            h, new_cache = layer(h, attn_mask=None, kv_cache=kv_caches[i])
+            kv_caches[i] = new_cache
+
+        h = self.ln_final(h)
+        h = torch.cat([h, r_emb, p_emb, c_emb], dim=-1)
+        return h, (pos_enc, kv_caches)
+
+
+# ---------------------------------------------------------------------------
+# GRU model
+# ---------------------------------------------------------------------------
+
+class GRUTonicNet(_TonicNetBase):
+    """GRU-based TonicNet for polyphonic music.
+
+    Smoother distribution than Transformer due to compressed hidden state.
+    Chord token directly modifies hidden state for subsequent pitches.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = 99,
+        x_dim: int = 100,
+        r_tokens: int = 80,
+        r_dim: int = 32,
+        p_tokens: int = 16,
+        p_dim: int = 8,
+        c_tokens: int = 48,
+        c_dim: int = 8,
+        hidden: int = 100,
+        n_gru_layers: int = 3,
+        dropout: float = 0.3,
+    ):
+        super().__init__(vocab_size, x_dim, r_tokens, r_dim, p_tokens, p_dim, c_tokens, c_dim)
+        self.hidden = hidden
+        self.n_gru_layers = n_gru_layers
+
+        input_dim = x_dim + r_dim + p_dim + c_dim  # 148
+
+        # GRU layers (separate modules for per-layer hidden state management)
+        self.gru1 = nn.GRU(input_dim, hidden, batch_first=True)
+        self.drop1 = nn.Dropout(dropout)
+        self.gru2 = nn.GRU(hidden, hidden, batch_first=True)
+        self.drop2 = nn.Dropout(dropout)
+        self.gru3 = nn.GRU(hidden, hidden, batch_first=True)
+        self.drop3 = nn.Dropout(dropout)
+
+        # Output: skip connection with r/p/c embeddings
+        self.dense = nn.Linear(hidden + r_dim + p_dim + c_dim, vocab_size)
+
+        self._init_weights()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        r: torch.Tensor,
+        p: torch.Tensor,
+        c: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass for training (full sequences).
+
+        Args:
+            x: token indices       [batch, seq_len]
+            r: repetition ids      [batch, seq_len]
+            p: position ids        [batch, seq_len]
+            c: countdown (bars remaining) [batch, seq_len]
+            pad_mask: accepted but ignored (GRU is unidirectional, right-padding is safe)
+
+        Returns:
+            logits [batch, seq_len, vocab_size]
+        """
+        x_emb = self.embedding_x(x)
+        r_emb = self.embedding_r(r)
+        p_emb = self.embedding_p(p)
+        c_emb = self.embedding_c(c)
+
+        h = torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1)
+
+        h, _ = self.gru1(h)
+        h = self.drop1(h)
+        h, _ = self.gru2(h)
+        h = self.drop2(h)
+        h, _ = self.gru3(h)
+        h = self.drop3(h)
+
+        # Skip connection: concat GRU output with r, p, c embeddings
+        h = torch.cat([h, r_emb, p_emb, c_emb], dim=-1)
+        return self.dense(h)
+
+    def _init_recurrence(self, device: torch.device, max_steps: int) -> Any:
+        return (None, None, None)  # GRU hidden states start as zeros
+
+    def _step(
+        self,
+        x_emb: torch.Tensor,
+        r_emb: torch.Tensor,
+        p_emb: torch.Tensor,
+        c_emb: torch.Tensor,
+        index: int,
+        state: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        h1, h2, h3 = state
+
+        inp = torch.cat([x_emb, r_emb, p_emb, c_emb], dim=-1)
+
+        out, h1 = self.gru1(inp, h1)
+        out = self.drop1(out)
+        out, h2 = self.gru2(out, h2)
+        out = self.drop2(out)
+        out, h3 = self.gru3(out, h3)
+        out = self.drop3(out)
+
+        # Skip connection
+        h = torch.cat([out, r_emb, p_emb, c_emb], dim=-1)
+        return h, (h1, h2, h3)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint I/O
+# ---------------------------------------------------------------------------
+
+def load_model(path: str, device: torch.device) -> _TonicNetBase:
+    """Load a versioned checkpoint, auto-detecting model type.
+
+    Returns the model on the given device in eval mode.
+    """
+    data = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(data, dict) or "version" not in data:
+        sys.exit(f"ERROR: {path} has no version field (pre-v4 checkpoint). "
+                 f"Retrain required.")
+    if data["version"] != MODEL_VERSION:
+        sys.exit(f"ERROR: {path} is version {data['version']}, "
+                 f"expected {MODEL_VERSION}. Retrain required.")
+
+    model_type = data.get("model_type", "xformer")
+    if model_type == "xformer":
+        model: _TonicNetBase = TonicNet()
+    elif model_type == "gru":
+        model = GRUTonicNet()
+    else:
+        sys.exit(f"ERROR: unknown model_type '{model_type}' in {path}")
+
+    model.load_state_dict(data["state_dict"], strict=True)
+    model.to(device)
+    model.eval()
+    return model

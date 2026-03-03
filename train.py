@@ -22,7 +22,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import VOCABULARY, SONG_START, SONG_END, MODEL_VERSION, load_checkpoint, TonicNet
+from model import (
+    VOCABULARY, SONG_START, SONG_END, MODEL_VERSION,
+    TonicNet, GRUTonicNet, _TonicNetBase, load_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +176,7 @@ def lr_lambda(step: int, warmup_steps: int, total_steps: int, min_lr: float, max
 # ---------------------------------------------------------------------------
 
 def train_epoch(
-    model: TonicNet,
+    model: _TonicNetBase,
     xs: list[torch.Tensor],
     rs: list[torch.Tensor],
     ps: list[torch.Tensor],
@@ -213,7 +216,7 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: TonicNet,
+    model: _TonicNetBase,
     xs: list[torch.Tensor],
     rs: list[torch.Tensor],
     ps: list[torch.Tensor],
@@ -251,6 +254,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing best weights")
+    parser.add_argument("--model-type", choices=["xformer", "gru"], default="xformer",
+                        help="Model architecture (default: xformer)")
     parser.add_argument("--out", default="tonicnet-best.pt",
                         help="Output path for best checkpoint")
     args = parser.parse_args()
@@ -270,12 +275,21 @@ def main() -> None:
     val_x, val_r, val_p, val_c, val_y = load_dataset("valid")
     print()
 
-    model = TonicNet()
+    model_type: str = args.model_type
     if args.weights:
-        state_dict = load_checkpoint(args.weights, device)
-        model.load_state_dict(state_dict, strict=True)
-        print(f"Loaded weights from {args.weights}")
-    model.to(device)
+        model = load_model(args.weights, device)
+        # Verify checkpoint model type matches --model-type if both given
+        loaded_type = "gru" if isinstance(model, GRUTonicNet) else "xformer"
+        if loaded_type != model_type:
+            sys.exit(f"ERROR: checkpoint is {loaded_type} but --model-type={model_type}")
+        model_type = loaded_type
+        print(f"Loaded {loaded_type} weights from {args.weights}")
+    else:
+        if model_type == "gru":
+            model = GRUTonicNet()
+        else:
+            model = TonicNet()
+        model.to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
@@ -337,7 +351,8 @@ def main() -> None:
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({"version": MODEL_VERSION, "state_dict": model.state_dict()}, args.out)
+            torch.save({"version": MODEL_VERSION, "model_type": model_type,
+                        "state_dict": model.state_dict()}, args.out)
             print(f"  -> saved {args.out} (val_loss={val_loss:.4f})")
 
     log_file.close()

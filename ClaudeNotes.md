@@ -83,3 +83,24 @@ Training considerations:
   - If quality is poor, fine-tune with a masked-voice objective:
     randomly mask one voice during training, predict the others
   - Teacher forcing with known soprano, sample the rest
+
+---
+
+  Why the Transformer has holes:
+  - It's a high-capacity lookup machine. It learns sharp, narrow peaks around training examples. Between those peaks are cliffs where it has no good answer.
+  - The chord token is "just another token" that the model must learn to attend to. In unfamiliar contexts (forced chord + forced soprano it never saw together), the attention patterns
+  don't generalize -- it falls into a crack.
+  - The stuck-note problem is a positive feedback loop: once it repeats a pitch, the repetition embedding rises, the context screams "we're repeating," and the Transformer says "great,
+  keep repeating" because that's what it saw in training when repetition was high.
+
+  Why the GRU is smoother:
+  - The compressed hidden state acts as a bottleneck regularizer. It can't memorize sharp peaks -- it's forced to learn smooth interpolations between training examples. Fewer holes.
+  - The chord token directly modifies the hidden state, and then that same hidden state generates the next 4 pitches. That's a much more direct conditioning pathway than "maybe the
+  attention heads will look at the chord token."
+  - The forget gate naturally decays old information, which limits runaway repetition loops.
+
+  In short: the GRU's limitations (compressed state, limited memory) are actually advantages here -- they force it to generalize smoothly rather than memorize. The Transformer's power
+  works against it on a small dataset.
+
+  More training would help fill some holes, but the fundamental topology of the Transformer's distribution will always be spikier than the GRU's. I'd say porting the GRU to this branch
+  is the right call. Want me to look at main and scope it out?

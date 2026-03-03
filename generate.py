@@ -12,7 +12,7 @@ import note_seq
 import numpy as np
 import torch
 
-from model import VOCABULARY, PITCH_REST, load_checkpoint, TonicNet
+from model import VOCABULARY, PITCH_REST, load_model
 
 
 # ---------------------------------------------------------------------------
@@ -254,12 +254,8 @@ def main() -> None:
     else:
         device = torch.device("cpu")
 
-    model = TonicNet()
-    state_dict = load_checkpoint(args.weights, device)
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
-    print(f"Loaded {args.weights} on {device}")
+    model = load_model(args.weights, device)
+    print(f"Loaded {args.weights} ({type(model).__name__}) on {device}")
 
     # Parse soprano seed if provided
     soprano_tokens: list[int] | None = None
