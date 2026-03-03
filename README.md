@@ -35,13 +35,15 @@ python generate.py 3 --weights tonicnet-best.pt
 ```
 make help           Show all targets
 make setup          Create venv and install dependencies (uses uv)
-make generate       Generate 3 samples from pretrained weights
+make generate       Generate 3 samples (16 bars each)
 make train          Fine-tune from existing weights (150 epochs)
 make train-scratch  Train from scratch (150 epochs)
 make snapshot       Snapshot tonicnet-best.pt with timestamp
 make wav            Render sample_1.mid to WAV (requires fluid-synth)
 make mp3            Render sample_1.mid to MP3 (requires ffmpeg)
+make playmidi       Play sample_1.mid via fluidsynth
 make clean          Remove generated MIDI and WAV files
+make distclean      Remove venv and all generated files
 ```
 
 ## Scripts
@@ -49,25 +51,27 @@ make clean          Remove generated MIDI and WAV files
 | Script | Purpose |
 |--------|---------|
 | `model.py` | Transformer and GRU model definitions, vocabulary, voice masking |
+| `model_v3.py` | Legacy v3 (pre-countdown) model definition |
 | `generate.py` | Autoregressive sampling with MIDI output, chord biasing, soprano seeding |
+| `generate_v3.py` | Legacy v3 model generator |
 | `train.py` | Training loop with masked loss and CSV logging |
-| `generate_v3.py` | Legacy v3 (pre-countdown) model generator |
 
 ### Generate
 
 ```bash
-python generate.py [n_samples] [--weights PATH] [--temperature T] [--bars N]
+python generate.py [n_samples] [--weights PATH] [--temperature T] [--bars N] [--gpu]
 python generate.py 1 --seed soprano.mid --chords chords.txt --chord-bias 2.0
 ```
 
-Produces MIDI files with random tempo (65-85 QPM) and temperature (0.25-0.75 if not fixed). Supports soprano-seeded harmonization with optional chord constraints.
+Produces MIDI files with random tempo (65-85 QPM) and temperature (0.25-0.75 if not fixed). Supports soprano-seeded harmonization with optional chord constraints and chord-tone logit biasing.
 
 ### Train
 
 ```bash
-python train.py                                            # train from scratch
-python train.py --weights tonicnet-best.pt --epochs 150    # fine-tune
-python train.py --overwrite --out tonicnet-best.pt         # overwrite checkpoint
+python train.py                                                    # train from scratch
+python train.py --weights tonicnet-best.pt --epochs 150            # fine-tune
+python train.py --model-type gru --out gru-best.pt                 # train GRU variant
+python train.py --overwrite --out tonicnet-best.pt                 # overwrite checkpoint
 ```
 
 Expects `dataset_train.p`, `dataset_valid.p`, `dataset_test.p` (TF2-format pickle files) in the working directory.
